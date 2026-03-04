@@ -1,0 +1,6 @@
+*.MOV
+*.mov
+venv/
+__pycache__/
+screenshots/
+
