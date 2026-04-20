@@ -26,9 +26,10 @@ import math
 import os
 import sys
 import json
+import csv
 import threading
 from datetime import datetime
-from flask import Flask, Response, render_template_string
+from flask import Flask, Response, render_template_string, jsonify
 
 
 # ═══════════════════════════════════════════
@@ -46,7 +47,10 @@ MEDIAPIPE_MODEL = 1            # 0=lite, 1=full, 2=heavy
 VIDEO_ROTATION = 180             # Rotate video: 0=none, 90=CW, 180=flip, 270=CCW
 SCREENSHOT_DIR = "screenshots"
 LOG_FILE = "posture_log.json"
+DATA_DIR = "data"
 WEB_PORT = 5000
+
+VALID_LABELS = {"unlabeled", "good", "slouch", "forward_head", "tilt"}
 
 
 # ═══════════════════════════════════════════
@@ -81,18 +85,35 @@ mp_styles = mp.solutions.drawing_styles
 
 current_frame = None        # Latest processed frame (BGR with overlays)
 frame_lock = threading.Lock()
+current_label = "unlabeled"  # user-selected label for data collection; updated via /label
 monitor_stats = {
     "score": 0,
     "status": "Starting...",
     "fps": 0,
     "alerts": 0,
     "session_start": None,
+    "mode": "calibrate",
+    "label": "unlabeled",
 }
 
 
 # ═══════════════════════════════════════════
 #  CAMERA HELPERS
 # ═══════════════════════════════════════════
+
+def _print_no_camera_help():
+    print()
+    print("=" * 55)
+    print("  [ERROR] No live camera detected.")
+    print("=" * 55)
+    print("  Troubleshooting:")
+    print("    1. Check the Pi Camera ribbon cable is seated.")
+    print("    2. List video devices:   ls /dev/video*")
+    print("    3. Test Pi camera:       libcamera-hello")
+    print("    4. Or replay a recording:")
+    print("         python3 posture_web.py --video <file.mp4>")
+    print("=" * 55)
+
 
 def init_camera(video_path=None):
     if video_path:
@@ -107,26 +128,35 @@ def init_camera(video_path=None):
         h = int(cam.get(cv2.CAP_PROP_FRAME_HEIGHT))
         print(f"[VIDEO] {w}x{h} @ {fps:.0f}fps, {total} frames ({total/fps:.1f}s)")
         return cam, "video"
-    elif USE_PICAMERA:
-        print("[CAM] Initializing picamera2...")
-        cam = Picamera2()
-        config = cam.create_preview_configuration(
-            main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "RGB888"}
-        )
-        cam.configure(config)
-        cam.start()
-        time.sleep(2)
-        print(f"[CAM] picamera2 ready")
-        return cam, "picamera2"
-    else:
-        print("[CAM] Initializing OpenCV VideoCapture...")
-        cam = cv2.VideoCapture(0)
-        cam.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-        cam.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-        if not cam.isOpened():
-            print("[ERROR] Cannot open camera!")
-            sys.exit(1)
-        return cam, "opencv"
+
+    if USE_PICAMERA:
+        try:
+            print("[CAM] Trying picamera2...")
+            cam = Picamera2()
+            config = cam.create_preview_configuration(
+                main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "RGB888"}
+            )
+            cam.configure(config)
+            cam.start()
+            time.sleep(2)
+            print("[CAM] picamera2 ready")
+            return cam, "picamera2"
+        except Exception as e:
+            print(f"[CAM] picamera2 unavailable ({e}); falling back to OpenCV.")
+
+    print("[CAM] Trying OpenCV VideoCapture(0)...")
+    cam = cv2.VideoCapture(0)
+    cam.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+    cam.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+    if cam.isOpened():
+        ret, _ = cam.read()
+        if ret:
+            print("[CAM] OpenCV VideoCapture ready")
+            return cam, "opencv"
+        cam.release()
+
+    _print_no_camera_help()
+    sys.exit(1)
 
 
 def get_frame(cam, cam_type):
@@ -241,6 +271,45 @@ def compute_posture_score(current, baseline):
 
     # Weights: Z-depth and position are most reliable
     weights = [0.30, 0.25, 0.20, 0.15, 0.10]
+    return min(sum(s * w for s, w in zip(scores, weights)), 100)
+
+
+def compute_posture_score_research(current):
+    """
+    Score using absolute thresholds from ergonomics literature — no personal
+    baseline required. Works from the first frame.
+
+    Signals used (all computable from a front-facing camera):
+      - shoulder_tilt (|L_sh.y - R_sh.y|):  lateral shoulder asymmetry.
+          Raine & Twomey (1997): normal adults sit within ~3 deg of level.
+          In MediaPipe normalized coords, >0.02 corresponds to ~5 deg in a
+          typical 640x480 framing — that's our "flag" threshold.
+      - ear_z_depth (ear.z - shoulder.z): negative = ears closer to camera
+          than shoulders = forward head posture (Yip 2008).
+      - nose_z_depth (nose.z - shoulder.z): severity of forward lean;
+          Hansraj (2014) showed cervical load grows sharply with forward
+          head flexion.
+
+    nose_y and face_size are intentionally excluded here — they depend on
+    where the user sits relative to the camera, so they have no universal
+    threshold without calibration.
+    """
+    scores = []
+
+    # Shoulder tilt: linear ramp from 0.02 (borderline) to 0.06 (severe)
+    tilt_excess = max(0.0, current["shoulder_tilt"] - 0.02)
+    scores.append(min(tilt_excess * 2500, 100))
+
+    # Forward head via ears (ear_z - shoulder_z < 0 means ears forward)
+    ear_fhp = max(0.0, -current["ear_z_depth"])
+    scores.append(min(ear_fhp * 1000, 100))
+
+    # Forward head via nose (more severe when the whole head thrusts forward)
+    nose_fhp = max(0.0, -current["nose_z_depth"])
+    scores.append(min(nose_fhp * 700, 100))
+
+    # FHP dominates because it's the most common desk-posture issue
+    weights = [0.30, 0.40, 0.30]
     return min(sum(s * w for s, w in zip(scores, weights)), 100)
 
 
@@ -475,10 +544,51 @@ def calibrate_live(cam, cam_type, pose_detector):
 
 
 # ═══════════════════════════════════════════
+#  DATA COLLECTION (per-session CSV)
+# ═══════════════════════════════════════════
+
+CSV_FIELDS = [
+    "timestamp", "mode", "label", "score", "is_bad",
+    "nose_y", "nose_z_depth", "ear_z_depth", "face_size", "shoulder_tilt",
+]
+
+
+class SessionLogger:
+    """Append one CSV row per processed frame. Line-buffered so crashes don't
+    lose the tail of the session."""
+
+    def __init__(self, path):
+        self.path = path
+        self.file = open(path, "w", newline="", buffering=1)
+        self.writer = csv.DictWriter(self.file, fieldnames=CSV_FIELDS)
+        self.writer.writeheader()
+        self.rows = 0
+
+    def log(self, mode, label, score, is_bad, metrics):
+        row = {
+            "timestamp": datetime.now().isoformat(timespec="milliseconds"),
+            "mode": mode,
+            "label": label,
+            "score": round(score, 2),
+            "is_bad": int(bool(is_bad)),
+        }
+        for key in ("nose_y", "nose_z_depth", "ear_z_depth", "face_size", "shoulder_tilt"):
+            row[key] = round(metrics[key], 4)
+        self.writer.writerow(row)
+        self.rows += 1
+
+    def close(self):
+        try:
+            self.file.close()
+        except Exception:
+            pass
+
+
+# ═══════════════════════════════════════════
 #  MONITOR THREAD
 # ═══════════════════════════════════════════
 
-def monitor_loop(video_path=None):
+def monitor_loop(video_path=None, mode="calibrate"):
     """Main posture monitoring — runs in a background thread."""
     global current_frame
 
@@ -493,20 +603,35 @@ def monitor_loop(video_path=None):
         min_tracking_confidence=0.5
     )
 
-    # Calibrate
-    if cam_type == "video":
-        print(f"[VIDEO] Auto-calibrating from first {CALIBRATION_SECONDS}s...")
-        baseline = calibrate_from_video(cam, cam_type, pose_detector)
-    else:
-        baseline = calibrate_live(cam, cam_type, pose_detector)
+    # Calibrate (self-calibrate mode only; research mode uses absolute thresholds)
+    baseline = None
+    if mode == "calibrate":
+        if cam_type == "video":
+            print(f"[VIDEO] Auto-calibrating from first {CALIBRATION_SECONDS}s...")
+            baseline = calibrate_from_video(cam, cam_type, pose_detector)
+        else:
+            baseline = calibrate_live(cam, cam_type, pose_detector)
 
-    if baseline is None:
-        release_camera(cam, cam_type)
-        return
+        if baseline is None:
+            release_camera(cam, cam_type)
+            return
+    else:
+        print(f"[RESEARCH] Using literature-backed thresholds (no calibration).")
+
+    monitor_stats["mode"] = mode
 
     print(f"\n[MONITORING] Live! Open http://<pi-ip>:{WEB_PORT} in browser")
-    print(f"  Threshold: {POSTURE_SCORE_THRESHOLD}/100 | Trigger: {BAD_POSTURE_TRIGGER}s")
+    print(f"  Mode: {mode} | Threshold: {POSTURE_SCORE_THRESHOLD}/100 | Trigger: {BAD_POSTURE_TRIGGER}s")
     print(f"  Press Ctrl+C to stop\n")
+
+    # Open per-session CSV for data collection
+    os.makedirs(DATA_DIR, exist_ok=True)
+    csv_path = os.path.join(
+        DATA_DIR,
+        f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{mode}.csv",
+    )
+    session_log = SessionLogger(csv_path)
+    print(f"[DATA] Logging frames to {csv_path}")
 
     # State
     bad_start = None
@@ -545,9 +670,16 @@ def monitor_loop(video_path=None):
                 if metrics is None:
                     continue
 
-                score = compute_posture_score(metrics, baseline)
+                if mode == "research":
+                    score = compute_posture_score_research(metrics)
+                else:
+                    score = compute_posture_score(metrics, baseline)
                 session_scores.append(score)
                 is_bad = score > POSTURE_SCORE_THRESHOLD
+
+                # Per-frame data collection row (captures whatever label the
+                # user has selected in the web UI).
+                session_log.log(mode, current_label, score, is_bad, metrics)
 
                 # --- State machine ---
                 if is_bad:
@@ -606,6 +738,7 @@ def monitor_loop(video_path=None):
                 monitor_stats["status"] = status
                 monitor_stats["fps"] = fps
                 monitor_stats["alerts"] = alert_count
+                monitor_stats["label"] = current_label
 
                 # Terminal output
                 if frame_count % 10 == 0:
@@ -631,6 +764,7 @@ def monitor_loop(video_path=None):
         buzzer_off()
         pose_detector.close()
         release_camera(cam, cam_type)
+        session_log.close()
 
         duration = time.time() - session_start
         print(f"\n{'='*55}")
@@ -639,11 +773,13 @@ def monitor_loop(video_path=None):
         if session_scores:
             avg = np.mean(session_scores)
             bad_pct = sum(1 for s in session_scores if s > POSTURE_SCORE_THRESHOLD) / len(session_scores) * 100
+            print(f"   Mode:         {mode}")
             print(f"   Duration:     {duration/60:.1f} min")
             print(f"   Avg score:    {avg:.1f}/100")
             print(f"   Bad posture:  {bad_pct:.1f}%")
             print(f"   Alerts:       {alert_count}")
             print(f"   Avg FPS:      {len(session_scores)/duration:.1f}")
+            print(f"   Rows logged:  {session_log.rows} → {csv_path}")
         print(f"{'='*55}\n")
 
 
@@ -717,6 +853,25 @@ HTML_PAGE = """
             font-size: 0.85em;
             margin-top: 5px;
         }
+        .labels {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            justify-content: center;
+            margin-top: 14px;
+        }
+        .labels button {
+            background: #16213e;
+            color: #eee;
+            border: 2px solid #555;
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.9em;
+        }
+        .labels button:hover { border-color: #00d4ff; }
+        .labels button.active { background: #00d4ff; color: #1a1a2e; border-color: #00d4ff; }
+        .label-status { color: #00d4ff; font-size: 0.9em; margin-top: 8px; }
     </style>
 </head>
 <body>
@@ -729,6 +884,14 @@ HTML_PAGE = """
     <div class="stream-container">
         <img src="/video_feed" alt="Live Stream">
     </div>
+    <div class="labels" id="label-buttons">
+        <button data-label="good" onclick="setLabel('good')">Good</button>
+        <button data-label="slouch" onclick="setLabel('slouch')">Slouch</button>
+        <button data-label="forward_head" onclick="setLabel('forward_head')">Forward Head</button>
+        <button data-label="tilt" onclick="setLabel('tilt')">Tilt</button>
+        <button data-label="unlabeled" onclick="setLabel('unlabeled')">Clear</button>
+    </div>
+    <p class="label-status" id="label-status">Labeling as: unlabeled</p>
     <p class="info">Score bar: <span style="color:#0c0">■</span> Good (0-30)
     <span style="color:#fb0">■</span> Warning (30-60)
     <span style="color:#e00">■</span> Bad (60-100) |
@@ -739,6 +902,19 @@ HTML_PAGE = """
                 document.getElementById('rot-label').textContent = 'Rotation: ' + d.rotation + '°';
             });
         }
+        function highlightLabel(name) {
+            document.querySelectorAll('#label-buttons button').forEach(b => {
+                b.classList.toggle('active', b.dataset.label === name);
+            });
+            document.getElementById('label-status').textContent = 'Labeling as: ' + name;
+        }
+        function setLabel(name) {
+            fetch('/label/' + name).then(r => r.json()).then(d => {
+                if (d.label) highlightLabel(d.label);
+            });
+        }
+        // Reflect current label on load (in case page was reopened mid-session)
+        fetch('/label').then(r => r.json()).then(d => highlightLabel(d.label));
     </script>
 </body>
 </html>
@@ -756,6 +932,22 @@ def rotate():
     VIDEO_ROTATION = (VIDEO_ROTATION + 90) % 360
     print(f"  [ROTATE] Video rotation set to {VIDEO_ROTATION}°")
     return {"rotation": VIDEO_ROTATION}
+
+
+@app.route("/label")
+def get_label():
+    return {"label": current_label}
+
+
+@app.route("/label/<name>")
+def set_label(name):
+    global current_label
+    if name not in VALID_LABELS:
+        return jsonify({"error": f"invalid label; allowed: {sorted(VALID_LABELS)}"}), 400
+    current_label = name
+    monitor_stats["label"] = name
+    print(f"  [LABEL] Current label → {name}")
+    return {"label": name}
 
 
 def generate_stream():
@@ -782,6 +974,28 @@ def video_feed():
 #  ENTRY POINT
 # ═══════════════════════════════════════════
 
+def prompt_mode():
+    """Blocking terminal prompt for mode selection. Accepts --mode CLI flag
+    as an override so headless launches don't get stuck."""
+    args = sys.argv[1:]
+    if "--mode" in args:
+        idx = args.index("--mode")
+        if idx + 1 < len(args) and args[idx + 1] in ("calibrate", "research"):
+            return args[idx + 1]
+
+    print()
+    print("Select scoring mode:")
+    print("  1) Self-calibrate  — 5s 'sit up straight' baseline (per-user)")
+    print("  2) Research        — ergonomics literature thresholds (no calibration)")
+    while True:
+        choice = input("Choice [1/2]: ").strip()
+        if choice == "1":
+            return "calibrate"
+        if choice == "2":
+            return "research"
+        print("  Invalid. Enter 1 or 2.")
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
     video_path = None
@@ -799,13 +1013,15 @@ if __name__ == "__main__":
     print("   ERGONOMIC POSTURE MONITOR")
     print(f"   Web view: http://<pi-ip>:{WEB_PORT}")
     print("=" * 55)
-    print()
+
+    mode = prompt_mode()
 
     monitor_stats["session_start"] = time.time()
+    monitor_stats["mode"] = mode
 
     # Start monitor in background thread
     monitor_thread = threading.Thread(
-        target=monitor_loop, args=(video_path,), daemon=True
+        target=monitor_loop, args=(video_path, mode), daemon=True
     )
     monitor_thread.start()
 
