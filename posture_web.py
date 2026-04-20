@@ -161,8 +161,10 @@ def init_camera(video_path=None):
 
 def get_frame(cam, cam_type):
     if cam_type == "picamera2":
-        frame_rgb = cam.capture_array()
-        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        # picamera2's "RGB888" format actually delivers bytes in BGR order
+        # (libcamera naming quirk) — so capture_array() returns a BGR buffer.
+        frame_bgr = cam.capture_array()
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         return True, frame_rgb, frame_bgr
     else:
         ret, frame_bgr = cam.read()
