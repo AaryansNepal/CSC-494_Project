@@ -4,4 +4,7 @@ venv/
 __pycache__/
 screenshots/
 data/
+pj/
+.DS_Store
+IMG_4600.HEIC
 
