@@ -28,9 +28,8 @@ import sys
 import json
 import csv
 import threading
-from collections import deque
 from datetime import datetime
-from flask import Flask, Response, render_template_string, jsonify, request, send_file
+from flask import Flask, Response, render_template_string, jsonify
 
 
 # ═══════════════════════════════════════════
@@ -101,48 +100,6 @@ monitor_stats = {
     "mode": "calibrate",
     "label": "unlabeled",
 }
-
-# Mutable runtime config — the sliders in the tuning drawer write here and the
-# monitor loop reads it every frame. Defaults match the constants above.
-CONFIG = {
-    "threshold": POSTURE_SCORE_THRESHOLD,
-    "margin": HYSTERESIS_MARGIN,
-    "alpha": SCORE_SMOOTHING_ALPHA,
-}
-
-# Live snapshot used by /stats — the monitor loop writes here on every frame,
-# the web thread reads without locking (dict writes are GIL-atomic).
-live_state = {
-    "score": 0.0,
-    "score_raw": 0.0,
-    "is_bad": False,
-    "buzzer_on": False,
-    "fps": 0.0,
-    "alerts": 0,
-    "rows": 0,
-    "mode": "calibrate",
-    "label": "unlabeled",
-    "paused": False,
-    "calibrating": False,
-    "calibration_progress": 0.0,   # 0.0 - 1.0, non-zero only during calibration
-    "sub_scores": {"nose_y": 0, "nose_z": 0, "ear_z": 0, "face_size": 0, "shoulder_tilt": 0},
-}
-
-# Ring buffer for the sparkline — 60 s of smoothed scores at ~10 FPS.
-SPARKLINE_LEN = 600
-sparkline_buffer = deque(maxlen=SPARKLINE_LEN)
-
-# 30-minute heatmap as 30 one-minute buckets. Each bucket = {avg, bad_pct, ts}.
-HEATMAP_BUCKETS = 30
-heatmap_buckets = deque(maxlen=HEATMAP_BUCKETS)
-_minute_scores = []           # accumulator for current minute
-_minute_bad_count = 0
-_minute_start = None
-
-# Pause flag — when True, the state machine is frozen (buzzer won't fire, timers
-# don't advance). Video stream, scoring, and CSV logging keep running so the
-# session data isn't interrupted.
-paused = False
 
 
 # ═══════════════════════════════════════════
@@ -296,26 +253,32 @@ def compute_posture_score(current, baseline):
       nose_z change of ~0.06 → score ~60
       ear_z change of ~0.04 → score ~55
       face_size change of ~0.02 → score ~60
-
-    Returns (total, breakdown) so the UI can show per-metric contributions.
-    `breakdown` is each metric's already-weighted contribution to the total.
     """
-    nose_y_drop  = min(max(0, baseline["nose_y"] - current["nose_y"]) * 800, 100)
-    z_forward    = min(max(0, abs(current["nose_z_depth"]) - abs(baseline["nose_z_depth"])) * 1000, 100)
-    ear_forward  = min(max(0, abs(current["ear_z_depth"]) - abs(baseline["ear_z_depth"])) * 1500, 100)
-    size_growth  = min(max(0, current["face_size"] - baseline["face_size"]) * 3000, 100)
-    tilt_dev     = min(max(0, current["shoulder_tilt"] - baseline["shoulder_tilt"]) * 400, 100)
+    scores = []
 
-    # Weighted contributions — each metric's share of the final score.
-    breakdown = {
-        "nose_y":        nose_y_drop * 0.30,
-        "nose_z":        z_forward   * 0.25,
-        "ear_z":         ear_forward * 0.20,
-        "face_size":     size_growth * 0.15,
-        "shoulder_tilt": tilt_dev    * 0.10,
-    }
-    total = min(sum(breakdown.values()), 100)
-    return total, breakdown
+    # Nose Y: baseline - current (positive = head dropped in frame)
+    nose_y_drop = baseline["nose_y"] - current["nose_y"]
+    scores.append(min(max(0, nose_y_drop) * 800, 100))
+
+    # Nose Z depth: current more negative than baseline = leaning forward
+    z_forward = abs(current["nose_z_depth"]) - abs(baseline["nose_z_depth"])
+    scores.append(min(max(0, z_forward) * 1000, 100))
+
+    # Ear Z vs shoulder Z: ears moving further forward than baseline
+    ear_forward = abs(current["ear_z_depth"]) - abs(baseline["ear_z_depth"])
+    scores.append(min(max(0, ear_forward) * 1500, 100))
+
+    # Face size: growing = leaning toward camera
+    size_growth = current["face_size"] - baseline["face_size"]
+    scores.append(min(max(0, size_growth) * 3000, 100))
+
+    # Shoulder tilt: deviation from baseline
+    tilt_dev = current["shoulder_tilt"] - baseline["shoulder_tilt"]
+    scores.append(min(max(0, tilt_dev) * 400, 100))
+
+    # Weights: Z-depth and position are most reliable
+    weights = [0.30, 0.25, 0.20, 0.15, 0.10]
+    return min(sum(s * w for s, w in zip(scores, weights)), 100)
 
 
 def compute_posture_score_research(current):
@@ -337,24 +300,24 @@ def compute_posture_score_research(current):
     nose_y and face_size are intentionally excluded here — they depend on
     where the user sits relative to the camera, so they have no universal
     threshold without calibration.
-
-    Returns (total, breakdown) mirroring compute_posture_score. Breakdown keys
-    match the self-calibrate version so the UI can render the same 5 bars —
-    the two unused metrics just read 0.
     """
-    tilt_score = min(max(0.0, current["shoulder_tilt"] - 0.02) * 2500, 100)
-    ear_score  = min(max(0.0, -current["ear_z_depth"]) * 1000, 100)
-    nose_score = min(max(0.0, -current["nose_z_depth"]) * 700, 100)
+    scores = []
 
-    breakdown = {
-        "nose_y":        0.0,
-        "nose_z":        nose_score * 0.30,
-        "ear_z":         ear_score  * 0.40,
-        "face_size":     0.0,
-        "shoulder_tilt": tilt_score * 0.30,
-    }
-    total = min(sum(breakdown.values()), 100)
-    return total, breakdown
+    # Shoulder tilt: linear ramp from 0.02 (borderline) to 0.06 (severe)
+    tilt_excess = max(0.0, current["shoulder_tilt"] - 0.02)
+    scores.append(min(tilt_excess * 2500, 100))
+
+    # Forward head via ears (ear_z - shoulder_z < 0 means ears forward)
+    ear_fhp = max(0.0, -current["ear_z_depth"])
+    scores.append(min(ear_fhp * 1000, 100))
+
+    # Forward head via nose (more severe when the whole head thrusts forward)
+    nose_fhp = max(0.0, -current["nose_z_depth"])
+    scores.append(min(nose_fhp * 700, 100))
+
+    # FHP dominates because it's the most common desk-posture issue
+    weights = [0.30, 0.40, 0.30]
+    return min(sum(s * w for s, w in zip(scores, weights)), 100)
 
 
 # ═══════════════════════════════════════════
@@ -484,8 +447,6 @@ def calibrate_from_video(cam, cam_type, pose_detector):
     cal_frames = int(fps * CALIBRATION_SECONDS)
     samples = []
 
-    live_state["calibrating"] = True
-
     for i in range(cal_frames):
         ret, frame_rgb, frame_bgr = get_frame(cam, cam_type)
         if not ret:
@@ -505,12 +466,9 @@ def calibrate_from_video(cam, cam_type, pose_detector):
                 global current_frame
                 current_frame = overlay.copy()
 
-        live_state["calibration_progress"] = (i + 1) / max(1, cal_frames)
         print(f"   Calibrating... {i+1}/{cal_frames} ({len(samples)} valid)", end="\r")
 
     print()
-    live_state["calibrating"] = False
-    live_state["calibration_progress"] = 0.0
 
     if len(samples) < 5:
         print(f"[ERROR] Only {len(samples)} valid samples.")
@@ -542,9 +500,6 @@ def calibrate_live(cam, cam_type, pose_detector):
     print(f"   SIT UP STRAIGHT! Calibrating for {CALIBRATION_SECONDS}s...")
     print(f"{'='*55}")
 
-    live_state["calibrating"] = True
-    live_state["calibration_progress"] = 0.0
-
     for i in range(3, 0, -1):
         # Show countdown on web view
         ret, frame_rgb, frame_bgr = get_frame(cam, cam_type)
@@ -571,18 +526,13 @@ def calibrate_live(cam, cam_type, pose_detector):
             if metrics is not None:
                 samples.append(metrics)
 
-            elapsed = time.time() - start
-            remaining = CALIBRATION_SECONDS - elapsed
-            live_state["calibration_progress"] = min(1.0, elapsed / CALIBRATION_SECONDS)
+            remaining = CALIBRATION_SECONDS - (time.time() - start)
             overlay = draw_overlay(frame_bgr, results.pose_landmarks, 0,
                                    f"CALIBRATING... {remaining:.1f}s left")
             cv2.putText(overlay, "HOLD STILL - GOOD POSTURE", (80, 250),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
             with frame_lock:
                 current_frame = overlay.copy()
-
-    live_state["calibrating"] = False
-    live_state["calibration_progress"] = 0.0
 
     if len(samples) < 10:
         print(f"[ERROR] Only {len(samples)} valid samples.")
@@ -686,10 +636,9 @@ def monitor_loop(video_path=None, mode="calibrate"):
         print(f"[RESEARCH] Using literature-backed thresholds (no calibration).")
 
     monitor_stats["mode"] = mode
-    live_state["mode"] = mode
 
     print(f"\n[MONITORING] Live! Open http://<pi-ip>:{WEB_PORT} in browser")
-    print(f"  Mode: {mode} | Threshold: {CONFIG['threshold']}/100 | Trigger: {BAD_POSTURE_TRIGGER}s")
+    print(f"  Mode: {mode} | Threshold: {POSTURE_SCORE_THRESHOLD}/100 | Trigger: {BAD_POSTURE_TRIGGER}s")
     print(f"  Press Ctrl+C to stop\n")
 
     # Open per-session CSV for data collection
@@ -710,16 +659,10 @@ def monitor_loop(video_path=None, mode="calibrate"):
                             # smoothed score clearly leaves the previous band
     frame_count = 0
     fps_timer = time.time()
-    alert_screenshot_taken = False   # one alert snapshot per session, full stop
+    last_screenshot = 0
     session_scores = []
-    session_score_sum = 0.0      # O(1) running mean accumulator
-    session_bad_count = 0        # O(1) running bad-frame counter
     alert_count = 0
     session_start = time.time()
-    live_state["session_start"] = session_start
-    live_state["csv_path"] = csv_path
-    live_state["summary_avg"] = 0.0
-    live_state["summary_bad_pct"] = 0.0
 
     try:
         while True:
@@ -748,76 +691,40 @@ def monitor_loop(video_path=None, mode="calibrate"):
                     continue
 
                 if mode == "research":
-                    raw_score, sub_scores = compute_posture_score_research(metrics)
+                    raw_score = compute_posture_score_research(metrics)
                 else:
-                    raw_score, sub_scores = compute_posture_score(metrics, baseline)
+                    raw_score = compute_posture_score(metrics, baseline)
 
                 # EMA smoothing — kills MediaPipe's Z-axis jitter before it
                 # reaches the state machine. Without this the score can swing
                 # ±10 points between frames on a motionless subject.
-                alpha = CONFIG["alpha"]
                 if smoothed_score is None:
                     smoothed_score = raw_score
                 else:
-                    smoothed_score = alpha * raw_score + (1.0 - alpha) * smoothed_score
+                    smoothed_score = (SCORE_SMOOTHING_ALPHA * raw_score
+                                      + (1.0 - SCORE_SMOOTHING_ALPHA) * smoothed_score)
 
                 # Hysteresis — only flip state when the smoothed score clearly
                 # leaves the previous band. Between (threshold - margin) and
                 # (threshold + margin) the current state is held, which stops
                 # noise near the line from thrashing BAD↔GOOD every frame.
-                thr = CONFIG["threshold"]
-                margin = CONFIG["margin"]
                 if is_bad_state:
-                    if smoothed_score < (thr - margin):
+                    if smoothed_score < (POSTURE_SCORE_THRESHOLD - HYSTERESIS_MARGIN):
                         is_bad_state = False
                 else:
-                    if smoothed_score > (thr + margin):
+                    if smoothed_score > (POSTURE_SCORE_THRESHOLD + HYSTERESIS_MARGIN):
                         is_bad_state = True
 
                 is_bad = is_bad_state
                 session_scores.append(smoothed_score)
-                session_score_sum += smoothed_score
-                if smoothed_score > CONFIG["threshold"]:
-                    session_bad_count += 1
 
                 # Per-frame data collection row — log both raw and smoothed so
                 # post-hoc analysis can re-smooth with a different window.
                 session_log.log(mode, current_label, raw_score, smoothed_score,
                                 is_bad, metrics)
 
-                # --- Telemetry buffers ---
-                sparkline_buffer.append(round(smoothed_score, 1))
-
-                # Roll up 60-second heatmap buckets using wall-clock time so
-                # FPS variation doesn't distort bucket widths.
-                global _minute_start, _minute_bad_count
-                if _minute_start is None:
-                    _minute_start = now
-                _minute_scores.append(smoothed_score)
+                # --- State machine ---
                 if is_bad:
-                    _minute_bad_count += 1
-                if now - _minute_start >= 60.0:
-                    heatmap_buckets.append({
-                        "avg": round(float(np.mean(_minute_scores)), 1),
-                        "bad_pct": round(100.0 * _minute_bad_count / max(1, len(_minute_scores)), 1),
-                        "ts": datetime.now().isoformat(timespec="seconds"),
-                    })
-                    _minute_scores.clear()
-                    _minute_bad_count = 0
-                    _minute_start = now
-
-                # --- State machine (pause freezes the timers + buzzer but
-                # scoring/logging/telemetry keep flowing).
-                if paused:
-                    # Silence any active buzzer and clear the timers so the
-                    # session resumes cleanly instead of inheriting stale state.
-                    if buzzer_active:
-                        buzzer_off()
-                        buzzer_active = False
-                    bad_start = None
-                    good_start = None
-                    status = "PAUSED — monitoring halted"
-                elif is_bad:
                     good_start = None
                     if bad_start is None:
                         bad_start = now
@@ -828,9 +735,9 @@ def monitor_loop(video_path=None, mode="calibrate"):
                         alert_count += 1
                         buzzer_on()
                         log_event("alert_start", smoothed_score, metrics)
-                        if not alert_screenshot_taken:
+                        if now - last_screenshot > 30:
                             save_screenshot(frame_bgr, smoothed_score, "alert")
-                            alert_screenshot_taken = True
+                            last_screenshot = now
 
                     if buzzer_active:
                         status = f"BUZZER ON | Alert #{alert_count}"
@@ -847,8 +754,7 @@ def monitor_loop(video_path=None, mode="calibrate"):
                             good_start = None
                             buzzer_off()
                             log_event("recovered", smoothed_score, metrics)
-                            # No recovery screenshot — we only keep calibration
-                            # + the first alert of the session.
+                            save_screenshot(frame_bgr, smoothed_score, "recovered")
                         status = f"Recovering: {good_duration:.0f}s / {GOOD_POSTURE_RECOVERY}s"
                     else:
                         good_start = None
@@ -877,25 +783,6 @@ def monitor_loop(video_path=None, mode="calibrate"):
                 monitor_stats["alerts"] = alert_count
                 monitor_stats["label"] = current_label
 
-                # Dashboard live snapshot — single dict drives /stats polling
-                live_state["score"] = round(smoothed_score, 1)
-                live_state["score_raw"] = round(raw_score, 1)
-                live_state["is_bad"] = bool(is_bad)
-                live_state["buzzer_on"] = bool(buzzer_active)
-                live_state["fps"] = round(fps, 1)
-                live_state["alerts"] = alert_count
-                live_state["rows"] = session_log.rows
-                live_state["mode"] = mode
-                live_state["label"] = current_label
-                live_state["paused"] = paused
-                live_state["sub_scores"] = {k: round(v, 1) for k, v in sub_scores.items()}
-
-                # Running session summary — O(1) from the accumulators above.
-                n = len(session_scores)
-                if n:
-                    live_state["summary_avg"]     = round(session_score_sum / n, 1)
-                    live_state["summary_bad_pct"] = round(100.0 * session_bad_count / n, 1)
-
                 # Terminal output — show smoothed score with raw in parens for
                 # quick sanity-check on how noisy the underlying signal is.
                 if frame_count % 10 == 0:
@@ -914,11 +801,6 @@ def monitor_loop(video_path=None, mode="calibrate"):
                 # instead of inheriting stale state from the previous sit.
                 smoothed_score = None
                 is_bad_state = False
-
-                live_state["is_bad"] = False
-                live_state["buzzer_on"] = False
-                live_state["score"] = 0.0
-                live_state["score_raw"] = 0.0
 
                 # Still update frame even without detection
                 cv2.putText(frame_bgr, "No person detected", (150, 250),
@@ -940,7 +822,7 @@ def monitor_loop(video_path=None, mode="calibrate"):
         print(f"{'='*55}")
         if session_scores:
             avg = np.mean(session_scores)
-            bad_pct = sum(1 for s in session_scores if s > CONFIG["threshold"]) / len(session_scores) * 100
+            bad_pct = sum(1 for s in session_scores if s > POSTURE_SCORE_THRESHOLD) / len(session_scores) * 100
             print(f"   Mode:         {mode}")
             print(f"   Duration:     {duration/60:.1f} min")
             print(f"   Avg score:    {avg:.1f}/100")
@@ -957,622 +839,148 @@ def monitor_loop(video_path=None, mode="calibrate"):
 
 app = Flask(__name__)
 
-HTML_PAGE = r"""
+HTML_PAGE = """
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html>
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Posture Monitor</title>
-<style>
-  :root {
-    --bg:        hsl(0 0% 3.9%);
-    --fg:        hsl(0 0% 98%);
-    --card:     hsl(0 0% 7%);
-    --card-hi:  hsl(0 0% 10%);
-    --border:   hsl(0 0% 14.9%);
-    --muted:    hsl(0 0% 14.9%);
-    --mf:       hsl(0 0% 63.9%);
-    --primary:  hsl(0 0% 98%);
-    --primary-fg: hsl(0 0% 9%);
-    --destructive: hsl(0 72% 51%);
-    --success:  hsl(142 71% 45%);
-    --warning:  hsl(38 92% 50%);
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body { background: var(--bg); color: var(--fg); height: 100%; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
-    font-size: 14px; line-height: 1.5;
-    padding: 24px;
-  }
-  .mono { font-family: "JetBrains Mono", "SF Mono", Menlo, monospace; }
-  .container { max-width: 1280px; margin: 0 auto; }
-
-  /* ---------- Top bar ---------- */
-  .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-  .topbar h1 { font-size: 18px; font-weight: 600; letter-spacing: -0.01em; }
-  .topbar .sub { color: var(--mf); font-size: 12px; margin-top: 2px; }
-  .topbar-actions { display: flex; gap: 8px; align-items: center; }
-
-  /* ---------- Cards ---------- */
-  .card {
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 20px;
-  }
-  .card h2 {
-    font-size: 10px; font-weight: 600; letter-spacing: 0.08em;
-    color: var(--mf); text-transform: uppercase; margin-bottom: 12px;
-  }
-
-  /* ---------- Main grid: video + side panel ---------- */
-  .grid { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 20px; }
-  .grid-lower { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px; margin-top: 20px; }
-
-  .video-card {
-    padding: 0; overflow: hidden; background: #000;
-    display: flex; align-items: center; justify-content: center;
-    min-height: 240px;
-  }
-  .video-card img {
-    display: block;
-    max-width: 100%;
-    max-height: 70vh;
-    width: auto;
-    height: auto;
-    object-fit: contain;   /* preserve aspect ratio for portrait OR landscape */
-  }
-
-  .stat-row { display: flex; justify-content: space-between; align-items: baseline; padding: 8px 0; border-bottom: 1px solid var(--border); }
-  .stat-row:last-child { border-bottom: none; }
-  .stat-row .k { color: var(--mf); font-size: 12px; }
-  .stat-row .v { font-size: 14px; }
-  .score-big { font-size: 48px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 6px; }
-  .score-big .unit { font-size: 16px; color: var(--mf); font-weight: 400; margin-left: 4px; }
-
-  /* ---------- Badges ---------- */
-  .badge { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 6px; font-size: 11px; font-weight: 500; letter-spacing: 0.04em; text-transform: uppercase; }
-  .badge-outline { border: 1px solid var(--border); color: var(--fg); background: transparent; }
-  .badge-success { background: hsl(142 71% 45% / 0.15); color: var(--success); border: 1px solid hsl(142 71% 45% / 0.3); }
-  .badge-destructive { background: hsl(0 72% 51% / 0.15); color: var(--destructive); border: 1px solid hsl(0 72% 51% / 0.3); }
-  .badge-warning { background: hsl(38 92% 50% / 0.15); color: var(--warning); border: 1px solid hsl(38 92% 50% / 0.3); }
-  .dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; background: currentColor; }
-
-  /* ---------- Buttons ---------- */
-  .btn { display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: 6px; font-size: 13px; font-weight: 500; cursor: pointer; border: 1px solid var(--border); background: transparent; color: var(--fg); transition: all 0.12s ease; }
-  .btn:hover { background: var(--muted); }
-  .btn-primary { background: var(--primary); color: var(--primary-fg); border-color: var(--primary); }
-  .btn-primary:hover { background: hsl(0 0% 90%); }
-  .btn-destructive { background: var(--destructive); color: var(--fg); border-color: var(--destructive); }
-  .btn-active { background: var(--primary); color: var(--primary-fg); border-color: var(--primary); }
-  .btn-xs { padding: 4px 10px; font-size: 12px; }
-
-  /* ---------- Sparkline ---------- */
-  .spark { width: 100%; height: 50px; display: block; }
-  .spark path.main { stroke: var(--fg); stroke-width: 1.5; fill: none; }
-  .spark path.overlay { stroke: var(--mf); stroke-width: 1; fill: none; stroke-dasharray: 3 3; opacity: 0.6; }
-  .spark line.threshold { stroke: var(--mf); stroke-width: 0.5; stroke-dasharray: 2 3; opacity: 0.4; }
-
-  /* ---------- Metric bars ---------- */
-  .metric { display: grid; grid-template-columns: 100px 1fr 40px; gap: 10px; align-items: center; padding: 5px 0; font-size: 12px; }
-  .metric .label { color: var(--mf); }
-  .metric .bar { height: 6px; background: var(--muted); border-radius: 3px; overflow: hidden; }
-  .metric .bar .fill { height: 100%; background: var(--fg); transition: width 0.3s ease; }
-  .metric .val { text-align: right; color: var(--mf); }
-
-  /* ---------- Labels ---------- */
-  .label-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-  .label-row .kbd { font-size: 10px; color: var(--mf); margin-left: 4px; }
-
-  /* ---------- Heatmap ---------- */
-  .heatmap { display: grid; grid-template-columns: repeat(30, 1fr); gap: 2px; height: 28px; }
-  .heatmap-cell { background: var(--muted); border-radius: 2px; transition: background 0.2s ease; }
-  .heatmap-cell.empty { background: hsl(0 0% 10%); }
-
-  /* ---------- Tuning drawer ---------- */
-  .tuning { display: none; margin-top: 20px; }
-  .tuning.open { display: block; }
-  .slider-row { display: grid; grid-template-columns: 120px 1fr 60px; gap: 12px; align-items: center; padding: 8px 0; font-size: 13px; }
-  .slider-row input[type=range] { width: 100%; accent-color: var(--primary); }
-  .slider-row .slider-val { font-family: "JetBrains Mono", monospace; text-align: right; color: var(--mf); }
-
-  /* ---------- Screenshot gallery ---------- */
-  .gallery { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 8px; }
-  .gallery img { height: 100px; border-radius: 6px; border: 1px solid var(--border); }
-
-  /* ---------- Sessions list ---------- */
-  .session-item { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; font-size: 12px; border-bottom: 1px solid var(--border); }
-  .session-item:last-child { border-bottom: none; }
-  .session-item .name { color: var(--mf); }
-  .session-item button { background: transparent; border: 1px solid var(--border); color: var(--fg); padding: 2px 8px; border-radius: 4px; cursor: pointer; font-size: 11px; }
-  .session-item button.active { background: var(--primary); color: var(--primary-fg); }
-
-  /* ---------- Calibration overlay ---------- */
-  .calibration-overlay {
-    position: fixed; inset: 0; background: hsl(0 0% 3.9% / 0.92);
-    display: none; align-items: center; justify-content: center; z-index: 100;
-    backdrop-filter: blur(6px);
-  }
-  .calibration-overlay.show { display: flex; }
-  .calibration-card { text-align: center; }
-  .ring {
-    width: 180px; height: 180px; margin: 0 auto 24px;
-    transform: rotate(-90deg);
-  }
-  .ring-bg { stroke: var(--muted); stroke-width: 8; fill: none; }
-  .ring-fg { stroke: var(--fg); stroke-width: 8; fill: none; stroke-linecap: round; transition: stroke-dashoffset 0.2s linear; }
-  .cal-title { font-size: 28px; font-weight: 600; margin-bottom: 8px; }
-  .cal-sub { color: var(--mf); font-size: 14px; }
-</style>
+    <title>Posture Monitor</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #1a1a2e;
+            color: #eee;
+            font-family: 'Segoe UI', Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }
+        h1 {
+            font-size: 1.8em;
+            margin-bottom: 5px;
+            color: #00d4ff;
+        }
+        .subtitle {
+            color: #888;
+            margin-bottom: 15px;
+            font-size: 0.9em;
+        }
+        .controls {
+            margin-bottom: 15px;
+        }
+        .controls button {
+            background: #16213e;
+            color: #00d4ff;
+            border: 2px solid #00d4ff;
+            padding: 8px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.95em;
+            margin: 0 5px;
+        }
+        .controls button:hover {
+            background: #00d4ff;
+            color: #1a1a2e;
+        }
+        .stream-container {
+            border: 3px solid #333;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 0 30px rgba(0, 212, 255, 0.15);
+        }
+        .stream-container img {
+            display: block;
+            max-width: 90vw;
+            max-height: 70vh;
+        }
+        .info {
+            margin-top: 15px;
+            color: #888;
+            font-size: 0.85em;
+        }
+        .rotation-label {
+            color: #00d4ff;
+            font-size: 0.85em;
+            margin-top: 5px;
+        }
+        .labels {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            justify-content: center;
+            margin-top: 14px;
+        }
+        .labels button {
+            background: #16213e;
+            color: #eee;
+            border: 2px solid #555;
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.9em;
+        }
+        .labels button:hover { border-color: #00d4ff; }
+        .labels button.active { background: #00d4ff; color: #1a1a2e; border-color: #00d4ff; }
+        .label-status { color: #00d4ff; font-size: 0.9em; margin-top: 8px; }
+    </style>
 </head>
-
 <body>
-
-<!-- Calibration overlay — shown while self-calibrate is running -->
-<div class="calibration-overlay" id="cal-overlay">
-  <div class="calibration-card">
-    <svg class="ring" viewBox="0 0 100 100">
-      <circle class="ring-bg" cx="50" cy="50" r="45" />
-      <circle class="ring-fg" id="cal-ring" cx="50" cy="50" r="45"
-              stroke-dasharray="282.7" stroke-dashoffset="282.7" />
-    </svg>
-    <div class="cal-title">Sit up straight</div>
-    <div class="cal-sub">Calibrating baseline · <span class="mono" id="cal-pct">0%</span></div>
-  </div>
-</div>
-
-<div class="container">
-
-  <!-- ───── Top bar ───── -->
-  <div class="topbar">
-    <div>
-      <h1>Ergonomic Posture Monitor</h1>
-      <div class="sub">Raspberry Pi 5 · MediaPipe Pose · <span id="clock" class="mono">00:00</span></div>
+    <h1>Ergonomic Posture Monitor</h1>
+    <p class="subtitle">Pi 5 + MediaPipe Pose | Real-time Analysis</p>
+    <div class="controls">
+        <button onclick="rotate()">↻ Rotate Video</button>
     </div>
-    <div class="topbar-actions">
-      <span id="mode-badge" class="badge badge-outline"><span class="dot"></span>—</span>
-      <button class="btn btn-xs" onclick="togglePause()"><span id="pause-label">Pause</span></button>
-      <button class="btn btn-xs" onclick="toggleTuning()">Tune</button>
-      <a class="btn btn-xs" id="download-link" href="/download/csv" download>Download CSV</a>
+    <p class="rotation-label" id="rot-label"></p>
+    <div class="stream-container">
+        <img src="/video_feed" alt="Live Stream">
     </div>
-  </div>
-
-  <!-- ───── Main grid: video | side panel ───── -->
-  <div class="grid">
-    <div class="card video-card"><img src="/video_feed" alt="Live Stream"></div>
-
-    <div>
-      <div class="card">
-        <h2>Score</h2>
-        <div class="score-big mono"><span id="score">0</span><span class="unit">/ 100</span></div>
-        <div style="margin-top: 6px;">
-          <span id="state-badge" class="badge badge-outline"><span class="dot"></span>—</span>
-        </div>
-        <div style="margin-top: 16px;">
-          <svg class="spark" id="spark" viewBox="0 0 600 50" preserveAspectRatio="none">
-            <line id="spark-thr-line" class="threshold" x1="0" y1="0" x2="600" y2="0" />
-            <path class="overlay" id="spark-overlay" d="" />
-            <path class="main" id="spark-path" d="" />
-          </svg>
-          <div style="display: flex; justify-content: space-between; font-size: 10px; color: var(--mf); margin-top: 2px;">
-            <span>60 s ago</span><span>now</span>
-          </div>
-        </div>
-      </div>
-
-      <div class="card" style="margin-top: 16px;">
-        <h2>Telemetry</h2>
-        <div class="stat-row"><span class="k">FPS</span><span class="v mono" id="fps">0.0</span></div>
-        <div class="stat-row"><span class="k">Alerts</span><span class="v mono" id="alerts">0</span></div>
-        <div class="stat-row"><span class="k">Rows logged</span><span class="v mono" id="rows">0</span></div>
-        <div class="stat-row"><span class="k">Mode</span><span class="v mono" id="mode">—</span></div>
-        <div class="stat-row"><span class="k">Buzzer</span><span class="v mono" id="buzzer">off</span></div>
-      </div>
-
-      <div class="card" style="margin-top: 16px;">
-        <h2>Session Summary</h2>
-        <div class="stat-row"><span class="k">Average score</span><span class="v mono" id="summary-avg">0.0</span></div>
-        <div class="stat-row"><span class="k">Bad posture</span><span class="v mono" id="summary-bad">0.0%</span></div>
-        <div class="stat-row"><span class="k">Duration</span><span class="v mono" id="summary-dur">00:00</span></div>
-      </div>
+    <div class="labels" id="label-buttons">
+        <button data-label="good" onclick="setLabel('good')">Good</button>
+        <button data-label="slouch" onclick="setLabel('slouch')">Slouch</button>
+        <button data-label="forward_head" onclick="setLabel('forward_head')">Forward Head</button>
+        <button data-label="tilt" onclick="setLabel('tilt')">Tilt</button>
+        <button data-label="unlabeled" onclick="setLabel('unlabeled')">Clear</button>
     </div>
-  </div>
-
-  <!-- ───── Lower row: metrics, heatmap, sessions ───── -->
-  <div class="grid-lower">
-    <div class="card">
-      <h2>Metric Contributions</h2>
-      <div id="metrics"></div>
-    </div>
-
-    <div class="card">
-      <h2>Last 30 min · Bad-posture density</h2>
-      <div class="heatmap" id="heatmap"></div>
-      <div style="display: flex; justify-content: space-between; font-size: 10px; color: var(--mf); margin-top: 6px;">
-        <span>30 min ago</span><span>now</span>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>Past Sessions</h2>
-      <div id="sessions" style="max-height: 180px; overflow-y: auto;"></div>
-    </div>
-  </div>
-
-  <!-- ───── Labels row ───── -->
-  <div class="card" style="margin-top: 20px;">
-    <h2>Label Current Pose</h2>
-    <div class="label-row" id="label-buttons">
-      <button class="btn" data-label="good" onclick="setLabel('good')">Good<span class="kbd">1</span></button>
-      <button class="btn" data-label="slouch" onclick="setLabel('slouch')">Slouch<span class="kbd">2</span></button>
-      <button class="btn" data-label="forward_head" onclick="setLabel('forward_head')">Forward Head<span class="kbd">3</span></button>
-      <button class="btn" data-label="tilt" onclick="setLabel('tilt')">Tilt<span class="kbd">4</span></button>
-      <button class="btn" data-label="unlabeled" onclick="setLabel('unlabeled')">Clear<span class="kbd">0</span></button>
-      <span style="margin-left: auto; color: var(--mf); font-size: 12px;">Current: <span id="current-label" class="mono">—</span></span>
-    </div>
-  </div>
-
-  <!-- ───── Tuning drawer ───── -->
-  <div class="card tuning" id="tuning">
-    <h2>Tuning · Live</h2>
-    <div class="slider-row">
-      <label for="s-thr">Bad threshold</label>
-      <input type="range" id="s-thr" min="10" max="90" step="1" value="40" oninput="onSlider()">
-      <span class="slider-val" id="s-thr-v">40</span>
-    </div>
-    <div class="slider-row">
-      <label for="s-mar">Hysteresis ±</label>
-      <input type="range" id="s-mar" min="0" max="20" step="1" value="5" oninput="onSlider()">
-      <span class="slider-val" id="s-mar-v">5</span>
-    </div>
-    <div class="slider-row">
-      <label for="s-a">Smoothing α</label>
-      <input type="range" id="s-a" min="0.05" max="0.5" step="0.05" value="0.20" oninput="onSlider()">
-      <span class="slider-val" id="s-a-v">0.20</span>
-    </div>
-  </div>
-
-  <!-- ───── Alert Screenshots ───── -->
-  <div class="card" style="margin-top: 20px;">
-    <h2>Alert Screenshots</h2>
-    <div class="gallery" id="gallery">
-      <span style="color: var(--mf); font-size: 12px;">No alerts yet.</span>
-    </div>
-  </div>
-
-</div>
-
-<audio id="alert-sound" preload="auto">
-  <source src="data:audio/wav;base64,UklGRl9vT19XQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=" type="audio/wav">
-</audio>
-
-<script>
-  // ─── state ───
-  let lastAlerts = 0;
-  let selectedSession = null;
-  let selectedSessionScores = null;
-
-  function fmtClock(seconds) {
-    if (!seconds || seconds < 0) return "00:00";
-    const h = Math.floor(seconds / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
-    const s = Math.floor(seconds % 60);
-    return (h ? String(h).padStart(2,'0')+':' : '') + String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
-  }
-
-  // ─── labels ───
-  const LABEL_KEYS = { '1':'good', '2':'slouch', '3':'forward_head', '4':'tilt', '0':'unlabeled' };
-  function highlightLabel(name) {
-    document.querySelectorAll('#label-buttons button').forEach(b => {
-      b.classList.toggle('btn-active', b.dataset.label === name);
-    });
-    document.getElementById('current-label').textContent = name;
-  }
-  function setLabel(name) {
-    fetch('/label/' + name).then(r => r.json()).then(d => { if (d.label) highlightLabel(d.label); });
-  }
-  document.addEventListener('keydown', (e) => {
-    if (e.target.tagName === 'INPUT') return;
-    if (LABEL_KEYS[e.key]) { setLabel(LABEL_KEYS[e.key]); e.preventDefault(); }
-    if (e.key === ' ') { togglePause(); e.preventDefault(); }
-  });
-
-  // ─── pause ───
-  function togglePause() {
-    fetch('/pause', { method: 'POST' }).then(r => r.json()).then(d => {
-      document.getElementById('pause-label').textContent = d.paused ? 'Resume' : 'Pause';
-    });
-  }
-
-  // ─── tuning drawer ───
-  function toggleTuning() { document.getElementById('tuning').classList.toggle('open'); }
-  function onSlider() {
-    const thr = parseInt(document.getElementById('s-thr').value);
-    const mar = parseInt(document.getElementById('s-mar').value);
-    const a   = parseFloat(document.getElementById('s-a').value);
-    document.getElementById('s-thr-v').textContent = thr;
-    document.getElementById('s-mar-v').textContent = mar;
-    document.getElementById('s-a-v').textContent   = a.toFixed(2);
-    fetch('/config', {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({threshold: thr, margin: mar, alpha: a})
-    });
-  }
-  function loadConfig() {
-    fetch('/config').then(r => r.json()).then(c => {
-      document.getElementById('s-thr').value = c.threshold;
-      document.getElementById('s-mar').value = c.margin;
-      document.getElementById('s-a').value   = c.alpha;
-      document.getElementById('s-thr-v').textContent = c.threshold;
-      document.getElementById('s-mar-v').textContent = c.margin;
-      document.getElementById('s-a-v').textContent   = Number(c.alpha).toFixed(2);
-    });
-  }
-
-  // ─── sparkline ───
-  function sparkPath(arr, w, h, maxVal) {
-    if (!arr || !arr.length) return "";
-    const n = arr.length;
-    let d = "";
-    for (let i = 0; i < n; i++) {
-      const x = (i / Math.max(1, n - 1)) * w;
-      const y = h - (Math.min(100, arr[i]) / maxVal) * h;
-      d += (i === 0 ? "M" : "L") + x.toFixed(1) + "," + y.toFixed(1) + " ";
-    }
-    return d;
-  }
-
-  // ─── metric contributions ───
-  const METRIC_ORDER = [
-    ["nose_y",        "nose Y"],
-    ["nose_z",        "nose Z"],
-    ["ear_z",         "ear Z (FHP)"],
-    ["face_size",     "face size"],
-    ["shoulder_tilt", "shoulder tilt"],
-  ];
-  function renderMetrics(sub) {
-    const host = document.getElementById('metrics');
-    host.innerHTML = METRIC_ORDER.map(([k, label]) => {
-      const v = sub && sub[k] != null ? sub[k] : 0;
-      const pct = Math.min(100, Math.max(0, v));
-      return `<div class="metric">
-                <span class="label">${label}</span>
-                <div class="bar"><div class="fill" style="width:${pct}%"></div></div>
-                <span class="val mono">${v.toFixed(1)}</span>
-              </div>`;
-    }).join('');
-  }
-
-  // ─── heatmap ───
-  function colorFor(badPct) {
-    // 0 = green, 50 = orange, 100 = red
-    const hue = 142 - (badPct / 100) * 142;   // 142 (emerald) → 0 (red)
-    const sat = 60 - (50 - Math.abs(50 - badPct));
-    return `hsl(${hue.toFixed(0)} 60% 35%)`;
-  }
-  function renderHeatmap(buckets) {
-    const host = document.getElementById('heatmap');
-    // Always render 30 cells, right-aligned (most recent on the right)
-    const cells = [];
-    const pad = 30 - buckets.length;
-    for (let i = 0; i < pad; i++) cells.push('<div class="heatmap-cell empty"></div>');
-    for (const b of buckets) {
-      cells.push(`<div class="heatmap-cell" style="background:${colorFor(b.bad_pct)}" title="avg ${b.avg} · bad ${b.bad_pct}%"></div>`);
-    }
-    host.innerHTML = cells.join('');
-  }
-
-  // ─── alert sound ───
-  function playBeep() {
-    try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const o = ctx.createOscillator(); const g = ctx.createGain();
-      o.type = 'square'; o.frequency.value = 880;
-      g.gain.value = 0.08;
-      o.connect(g); g.connect(ctx.destination);
-      o.start(); setTimeout(() => { o.stop(); ctx.close(); }, 180);
-    } catch (e) {}
-  }
-
-  // ─── main poll ───
-  function setState(s) {
-    const badge = document.getElementById('state-badge');
-    badge.classList.remove('badge-outline', 'badge-success', 'badge-destructive', 'badge-warning');
-    if (s.paused) { badge.classList.add('badge-warning'); badge.innerHTML = '<span class="dot"></span>PAUSED'; }
-    else if (s.buzzer_on && s.is_bad) { badge.classList.add('badge-destructive'); badge.innerHTML = '<span class="dot"></span>BUZZER ON'; }
-    else if (s.is_bad) { badge.classList.add('badge-destructive'); badge.innerHTML = '<span class="dot"></span>BAD POSTURE'; }
-    else if (s.buzzer_on) { badge.classList.add('badge-warning'); badge.innerHTML = '<span class="dot"></span>RECOVERING'; }
-    else { badge.classList.add('badge-success'); badge.innerHTML = '<span class="dot"></span>GOOD POSTURE'; }
-  }
-
-  async function poll() {
-    try {
-      const r = await fetch('/stats');
-      const s = await r.json();
-
-      document.getElementById('score').textContent = s.score.toFixed(0);
-      document.getElementById('fps').textContent   = s.fps.toFixed(1);
-      document.getElementById('alerts').textContent= s.alerts;
-      document.getElementById('rows').textContent  = s.rows.toLocaleString();
-      document.getElementById('mode').textContent  = s.mode;
-      document.getElementById('buzzer').textContent= s.buzzer_on ? 'on' : 'off';
-      document.getElementById('pause-label').textContent = s.paused ? 'Resume' : 'Pause';
-
-      // mode badge
-      const mbd = document.getElementById('mode-badge');
-      mbd.innerHTML = '<span class="dot"></span>' + s.mode.toUpperCase();
-
-      // session clock + summary card
-      if (s.session_start) {
-        document.getElementById('clock').textContent = 'session ' + fmtClock(s.duration);
-        document.getElementById('summary-dur').textContent = fmtClock(s.duration);
-      }
-      document.getElementById('summary-avg').textContent = s.summary_avg.toFixed(1);
-      document.getElementById('summary-bad').textContent = s.summary_bad_pct.toFixed(1) + '%';
-
-      // calibration overlay — shown while self-calibrate runs
-      const overlay = document.getElementById('cal-overlay');
-      if (s.calibrating) {
-        overlay.classList.add('show');
-        const CIRC = 282.7;                      // 2π·45
-        const off = CIRC * (1 - (s.calibration_progress || 0));
-        document.getElementById('cal-ring').setAttribute('stroke-dashoffset', off.toFixed(1));
-        document.getElementById('cal-pct').textContent = Math.round((s.calibration_progress || 0) * 100) + '%';
-      } else {
-        overlay.classList.remove('show');
-      }
-
-      // state badge
-      setState(s);
-
-      // sparkline
-      const spark = s.sparkline || [];
-      document.getElementById('spark-path').setAttribute('d', sparkPath(spark, 600, 50, 100));
-      // threshold line
-      const thrY = 50 - (s.config.threshold / 100) * 50;
-      document.getElementById('spark-thr-line').setAttribute('y1', thrY.toFixed(1));
-      document.getElementById('spark-thr-line').setAttribute('y2', thrY.toFixed(1));
-      // overlay sparkline from selected past session
-      if (selectedSessionScores) {
-        document.getElementById('spark-overlay').setAttribute('d', sparkPath(selectedSessionScores.slice(-600), 600, 50, 100));
-      } else {
-        document.getElementById('spark-overlay').setAttribute('d', '');
-      }
-
-      // metrics
-      renderMetrics(s.sub_scores);
-
-      // heatmap
-      renderHeatmap(s.heatmap || []);
-
-      // current label
-      highlightLabel(s.label || 'unlabeled');
-
-      // alert sound (play on alert count increment)
-      if (s.alerts > lastAlerts) { playBeep(); lastAlerts = s.alerts; }
-
-    } catch (e) { /* retry next tick */ }
-  }
-
-  // ─── past sessions list ───
-  async function loadSessions() {
-    try {
-      const r = await fetch('/sessions');
-      const arr = await r.json();
-      const host = document.getElementById('sessions');
-      if (!arr.length) { host.innerHTML = '<span style="color:var(--mf);font-size:12px;">No past sessions.</span>'; return; }
-      host.innerHTML = arr.slice(0, 20).map(s => `
-        <div class="session-item">
-          <span class="name mono">${s.name}</span>
-          <div>
-            <span style="color:var(--mf);font-size:11px;margin-right:8px;">${s.rows} rows</span>
-            <button data-name="${s.name}" onclick="toggleSession('${s.name}')">overlay</button>
-          </div>
-        </div>`).join('');
-    } catch (e) {}
-  }
-  async function toggleSession(name) {
-    const btns = document.querySelectorAll('#sessions button');
-    if (selectedSession === name) {
-      selectedSession = null; selectedSessionScores = null;
-      btns.forEach(b => b.classList.remove('active'));
-    } else {
-      selectedSession = name;
-      btns.forEach(b => b.classList.toggle('active', b.dataset.name === name));
-      try {
-        const r = await fetch('/sessions/' + encodeURIComponent(name) + '/scores');
-        selectedSessionScores = await r.json();
-      } catch (e) { selectedSessionScores = null; }
-    }
-  }
-
-  // ─── gallery ───
-  async function loadGallery() {
-    try {
-      const r = await fetch('/screenshots');
-      const arr = await r.json();
-      const host = document.getElementById('gallery');
-      if (!arr.length) { host.innerHTML = '<span style="color:var(--mf);font-size:12px;">No alerts yet.</span>'; return; }
-      host.innerHTML = arr.slice(-30).reverse().map(name =>
-        `<img src="/screenshots/${encodeURIComponent(name)}" alt="${name}" title="${name}">`
-      ).join('');
-    } catch (e) {}
-  }
-
-  loadConfig();
-  loadSessions();
-  loadGallery();
-  poll();
-  setInterval(poll, 500);
-  setInterval(loadSessions, 15000);
-  setInterval(loadGallery, 10000);
-</script>
+    <p class="label-status" id="label-status">Labeling as: unlabeled</p>
+    <p class="info">Score bar: <span style="color:#0c0">■</span> Good (0-30)
+    <span style="color:#fb0">■</span> Warning (30-60)
+    <span style="color:#e00">■</span> Bad (60-100) |
+    Buzzer triggers after """ + str(BAD_POSTURE_TRIGGER) + """s of bad posture</p>
+    <script>
+        function rotate() {
+            fetch('/rotate').then(r => r.json()).then(d => {
+                document.getElementById('rot-label').textContent = 'Rotation: ' + d.rotation + '°';
+            });
+        }
+        function highlightLabel(name) {
+            document.querySelectorAll('#label-buttons button').forEach(b => {
+                b.classList.toggle('active', b.dataset.label === name);
+            });
+            document.getElementById('label-status').textContent = 'Labeling as: ' + name;
+        }
+        function setLabel(name) {
+            fetch('/label/' + name).then(r => r.json()).then(d => {
+                if (d.label) highlightLabel(d.label);
+            });
+        }
+        // Reflect current label on load (in case page was reopened mid-session)
+        fetch('/label').then(r => r.json()).then(d => highlightLabel(d.label));
+    </script>
 </body>
 </html>
 """
 
-
-# ─── routes ─────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
     return render_template_string(HTML_PAGE)
 
 
-@app.route("/video_feed")
-def video_feed():
-    return Response(generate_stream(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
-
-
-def generate_stream():
-    """Yield MJPEG frames for the browser."""
-    while True:
-        with frame_lock:
-            if current_frame is None:
-                time.sleep(0.05)
-                continue
-            _, jpeg = cv2.imencode('.jpg', current_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
-        time.sleep(0.05)
-
-
-@app.route("/stats")
-def stats():
-    """Single polling endpoint — everything the dashboard needs in one JSON."""
-    ss = live_state.get("session_start")
-    duration = time.time() - ss if ss else 0
-    return jsonify({
-        "score":        live_state["score"],
-        "score_raw":    live_state["score_raw"],
-        "is_bad":       live_state["is_bad"],
-        "buzzer_on":    live_state["buzzer_on"],
-        "fps":          live_state["fps"],
-        "alerts":       live_state["alerts"],
-        "rows":         live_state["rows"],
-        "mode":         live_state["mode"],
-        "label":        live_state["label"],
-        "paused":       live_state["paused"],
-        "calibrating":  live_state["calibrating"],
-        "calibration_progress": live_state["calibration_progress"],
-        "summary_avg":      live_state.get("summary_avg", 0.0),
-        "summary_bad_pct":  live_state.get("summary_bad_pct", 0.0),
-        "session_start": ss,
-        "duration":     duration,
-        "sub_scores":   live_state["sub_scores"],
-        "sparkline":    list(sparkline_buffer),
-        "heatmap":      list(heatmap_buckets),
-        "config":       CONFIG,
-    })
-
-
 @app.route("/rotate")
 def rotate():
     global VIDEO_ROTATION
     VIDEO_ROTATION = (VIDEO_ROTATION + 90) % 360
+    print(f"  [ROTATE] Video rotation set to {VIDEO_ROTATION}°")
     return {"rotation": VIDEO_ROTATION}
 
 
@@ -1588,101 +996,28 @@ def set_label(name):
         return jsonify({"error": f"invalid label; allowed: {sorted(VALID_LABELS)}"}), 400
     current_label = name
     monitor_stats["label"] = name
-    live_state["label"] = name
+    print(f"  [LABEL] Current label → {name}")
     return {"label": name}
 
 
-@app.route("/config", methods=["GET"])
-def config_get():
-    return jsonify(CONFIG)
+def generate_stream():
+    """Yield MJPEG frames for the browser."""
+    while True:
+        with frame_lock:
+            if current_frame is None:
+                time.sleep(0.05)
+                continue
+            _, jpeg = cv2.imencode('.jpg', current_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
+        time.sleep(0.05)  # ~20fps max for web stream
 
 
-@app.route("/config", methods=["POST"])
-def config_set():
-    body = request.get_json(silent=True) or {}
-    if "threshold" in body:
-        CONFIG["threshold"] = max(0, min(100, float(body["threshold"])))
-    if "margin" in body:
-        CONFIG["margin"] = max(0, min(50, float(body["margin"])))
-    if "alpha" in body:
-        CONFIG["alpha"] = max(0.01, min(1.0, float(body["alpha"])))
-    return jsonify(CONFIG)
-
-
-@app.route("/pause", methods=["POST"])
-def pause_toggle():
-    global paused
-    paused = not paused
-    live_state["paused"] = paused
-    return jsonify({"paused": paused})
-
-
-@app.route("/download/csv")
-def download_csv():
-    path = live_state.get("csv_path")
-    if not path or not os.path.exists(path):
-        return jsonify({"error": "no active session CSV"}), 404
-    return send_file(path, as_attachment=True,
-                     download_name=os.path.basename(path), mimetype="text/csv")
-
-
-@app.route("/screenshots")
-def screenshots_list():
-    if not os.path.isdir(SCREENSHOT_DIR):
-        return jsonify([])
-    files = [f for f in os.listdir(SCREENSHOT_DIR) if f.lower().endswith((".jpg", ".jpeg", ".png"))]
-    files.sort()
-    return jsonify(files)
-
-
-@app.route("/screenshots/<path:name>")
-def screenshots_serve(name):
-    # Basic safety — no traversal
-    if ".." in name or name.startswith("/"):
-        return "", 400
-    return send_file(os.path.join(SCREENSHOT_DIR, name))
-
-
-@app.route("/sessions")
-def sessions_list():
-    if not os.path.isdir(DATA_DIR):
-        return jsonify([])
-    out = []
-    for name in sorted(os.listdir(DATA_DIR), reverse=True):
-        if not name.endswith(".csv"):
-            continue
-        full = os.path.join(DATA_DIR, name)
-        try:
-            with open(full) as f:
-                rows = sum(1 for _ in f) - 1
-        except Exception:
-            rows = 0
-        out.append({"name": name, "rows": max(0, rows)})
-    return jsonify(out)
-
-
-@app.route("/sessions/<path:name>/scores")
-def session_scores(name):
-    if ".." in name or name.startswith("/") or not name.endswith(".csv"):
-        return jsonify([]), 400
-    full = os.path.join(DATA_DIR, name)
-    if not os.path.exists(full):
-        return jsonify([]), 404
-    # Prefer score_smoothed, fall back to score
-    scores = []
-    try:
-        with open(full) as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                v = row.get("score_smoothed") or row.get("score")
-                if v is not None:
-                    try:
-                        scores.append(float(v))
-                    except ValueError:
-                        pass
-    except Exception:
-        pass
-    return jsonify(scores)
+@app.route("/video_feed")
+def video_feed():
+    return Response(generate_stream(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
 
 # ═══════════════════════════════════════════
