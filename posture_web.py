@@ -186,14 +186,7 @@ def init_camera(video_path=None):
             )
             cam.configure(config)
             cam.start()
-            # OV5647 (Rev 1.3) has slow AWB convergence and skews green/warm
-            # under mixed indoor light. Nudge it with explicit controls and
-            # give it a few seconds to lock before calibration starts.
-            try:
-                cam.set_controls({"AwbEnable": True, "AwbMode": 0, "AeEnable": True})
-            except Exception as e:
-                print(f"[CAM] AWB/AE control not accepted ({e}); using defaults.")
-            time.sleep(4)
+            time.sleep(2)
             print("[CAM] picamera2 ready")
             return cam, "picamera2"
         except Exception as e:
@@ -216,12 +209,10 @@ def init_camera(video_path=None):
 
 def get_frame(cam, cam_type):
     if cam_type == "picamera2":
-        # On Pi 5 + OV5647 (Rev 1.3), picamera2's "RGB888" delivers bytes in
-        # RGB order — use it directly for MediaPipe and convert to BGR for
-        # OpenCV drawing / JPEG encoding. (Treating it as BGR produced a
-        # teal/orange cast on this sensor.)
-        frame_rgb = cam.capture_array()
-        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        # picamera2's "RGB888" format actually delivers bytes in BGR order
+        # (libcamera naming quirk) — so capture_array() returns a BGR buffer.
+        frame_bgr = cam.capture_array()
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         return True, frame_rgb, frame_bgr
     else:
         ret, frame_bgr = cam.read()
