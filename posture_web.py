@@ -42,9 +42,14 @@ CAMERA_HEIGHT = 480
 CALIBRATION_SECONDS = 5
 BAD_POSTURE_TRIGGER = 10       # seconds bad before buzzer
 GOOD_POSTURE_RECOVERY = 3      # seconds good before buzzer off
-POSTURE_SCORE_THRESHOLD = 40   # 0-100, above = bad
+POSTURE_SCORE_THRESHOLD = 40   # 0-100, center of the good/bad band
+HYSTERESIS_MARGIN = 5          # ± around threshold. Must exceed 45 to flip to bad,
+                               # drop below 35 to flip back to good. In between the
+                               # state is held, so threshold-line noise stops thrashing.
+SCORE_SMOOTHING_ALPHA = 0.2    # EMA weight for the raw score. new = α·raw + (1-α)·prev
+                               # Lower = heavier smoothing. 0.2 ≈ 5-frame window @ 10 FPS.
 MEDIAPIPE_MODEL = 1            # 0=lite, 1=full, 2=heavy
-VIDEO_ROTATION = 180             # Rotate video: 0=none, 90=CW, 180=flip, 270=CCW
+VIDEO_ROTATION = 0             # Rotate video: 0=none, 90=CW, 180=flip, 270=CCW
 SCREENSHOT_DIR = "screenshots"
 LOG_FILE = "posture_log.json"
 DATA_DIR = "data"
@@ -372,8 +377,14 @@ def log_event(event_type, score, metrics):
 #  DRAW OVERLAY ON FRAME
 # ═══════════════════════════════════════════
 
-def draw_overlay(frame_bgr, landmarks, score, status):
-    """Draw skeleton, score bar, and status label on frame."""
+def draw_overlay(frame_bgr, landmarks, score, status, is_bad=False):
+    """Draw skeleton, score bar, and status label on frame.
+
+    ``score`` should be the smoothed score (what the state machine sees),
+    and ``is_bad`` is the hysteresis-stable state — passed in so the UI
+    stays in sync with the authoritative decision, instead of re-evaluating
+    a raw threshold that might flicker near the line.
+    """
     h, w = frame_bgr.shape[:2]
 
     # Draw MediaPipe skeleton
@@ -405,8 +416,6 @@ def draw_overlay(frame_bgr, landmarks, score, status):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
     # --- Status label (top right) ---
-    is_bad = score > POSTURE_SCORE_THRESHOLD
-
     if is_bad:
         label = "BAD POSTURE"
         bg_color = (0, 0, 180)
@@ -550,14 +559,19 @@ def calibrate_live(cam, cam_type, pose_detector):
 # ═══════════════════════════════════════════
 
 CSV_FIELDS = [
-    "timestamp", "mode", "label", "score", "is_bad",
+    "timestamp", "mode", "label", "score", "score_smoothed", "is_bad",
     "nose_y", "nose_z_depth", "ear_z_depth", "face_size", "shoulder_tilt",
 ]
 
 
 class SessionLogger:
     """Append one CSV row per processed frame. Line-buffered so crashes don't
-    lose the tail of the session."""
+    lose the tail of the session.
+
+    Logs both the raw per-frame score and the smoothed score used by the
+    state machine — raw is preserved so later analysis can re-smooth with
+    a different window if needed.
+    """
 
     def __init__(self, path):
         self.path = path
@@ -566,12 +580,13 @@ class SessionLogger:
         self.writer.writeheader()
         self.rows = 0
 
-    def log(self, mode, label, score, is_bad, metrics):
+    def log(self, mode, label, score_raw, score_smoothed, is_bad, metrics):
         row = {
             "timestamp": datetime.now().isoformat(timespec="milliseconds"),
             "mode": mode,
             "label": label,
-            "score": round(score, 2),
+            "score": round(score_raw, 2),
+            "score_smoothed": round(score_smoothed, 2),
             "is_bad": int(bool(is_bad)),
         }
         for key in ("nose_y", "nose_z_depth", "ear_z_depth", "face_size", "shoulder_tilt"):
@@ -639,6 +654,9 @@ def monitor_loop(video_path=None, mode="calibrate"):
     bad_start = None
     good_start = None
     buzzer_active = False
+    smoothed_score = None   # EMA-smoothed score; None until first valid frame
+    is_bad_state = False    # Hysteresis-stable classification; only flips when
+                            # smoothed score clearly leaves the previous band
     frame_count = 0
     fps_timer = time.time()
     last_screenshot = 0
@@ -673,15 +691,37 @@ def monitor_loop(video_path=None, mode="calibrate"):
                     continue
 
                 if mode == "research":
-                    score = compute_posture_score_research(metrics)
+                    raw_score = compute_posture_score_research(metrics)
                 else:
-                    score = compute_posture_score(metrics, baseline)
-                session_scores.append(score)
-                is_bad = score > POSTURE_SCORE_THRESHOLD
+                    raw_score = compute_posture_score(metrics, baseline)
 
-                # Per-frame data collection row (captures whatever label the
-                # user has selected in the web UI).
-                session_log.log(mode, current_label, score, is_bad, metrics)
+                # EMA smoothing — kills MediaPipe's Z-axis jitter before it
+                # reaches the state machine. Without this the score can swing
+                # ±10 points between frames on a motionless subject.
+                if smoothed_score is None:
+                    smoothed_score = raw_score
+                else:
+                    smoothed_score = (SCORE_SMOOTHING_ALPHA * raw_score
+                                      + (1.0 - SCORE_SMOOTHING_ALPHA) * smoothed_score)
+
+                # Hysteresis — only flip state when the smoothed score clearly
+                # leaves the previous band. Between (threshold - margin) and
+                # (threshold + margin) the current state is held, which stops
+                # noise near the line from thrashing BAD↔GOOD every frame.
+                if is_bad_state:
+                    if smoothed_score < (POSTURE_SCORE_THRESHOLD - HYSTERESIS_MARGIN):
+                        is_bad_state = False
+                else:
+                    if smoothed_score > (POSTURE_SCORE_THRESHOLD + HYSTERESIS_MARGIN):
+                        is_bad_state = True
+
+                is_bad = is_bad_state
+                session_scores.append(smoothed_score)
+
+                # Per-frame data collection row — log both raw and smoothed so
+                # post-hoc analysis can re-smooth with a different window.
+                session_log.log(mode, current_label, raw_score, smoothed_score,
+                                is_bad, metrics)
 
                 # --- State machine ---
                 if is_bad:
@@ -694,9 +734,9 @@ def monitor_loop(video_path=None, mode="calibrate"):
                         buzzer_active = True
                         alert_count += 1
                         buzzer_on()
-                        log_event("alert_start", score, metrics)
+                        log_event("alert_start", smoothed_score, metrics)
                         if now - last_screenshot > 30:
-                            save_screenshot(frame_bgr, score, "alert")
+                            save_screenshot(frame_bgr, smoothed_score, "alert")
                             last_screenshot = now
 
                     if buzzer_active:
@@ -713,8 +753,8 @@ def monitor_loop(video_path=None, mode="calibrate"):
                             buzzer_active = False
                             good_start = None
                             buzzer_off()
-                            log_event("recovered", score, metrics)
-                            save_screenshot(frame_bgr, score, "recovered")
+                            log_event("recovered", smoothed_score, metrics)
+                            save_screenshot(frame_bgr, smoothed_score, "recovered")
                         status = f"Recovering: {good_duration:.0f}s / {GOOD_POSTURE_RECOVERY}s"
                     else:
                         good_start = None
@@ -727,25 +767,29 @@ def monitor_loop(video_path=None, mode="calibrate"):
                 # Build status line
                 full_status = f"FPS: {fps:.1f} | {status}"
 
-                # Draw overlay on frame
+                # Draw overlay on frame — pass smoothed score + stable state so
+                # the UI matches what the state machine is actually acting on.
                 display_frame = draw_overlay(frame_bgr.copy(), results.pose_landmarks,
-                                             score, full_status)
+                                             smoothed_score, full_status, is_bad)
 
                 # Update shared frame for web stream
                 with frame_lock:
                     current_frame = display_frame
 
                 # Update stats
-                monitor_stats["score"] = score
+                monitor_stats["score"] = smoothed_score
                 monitor_stats["status"] = status
                 monitor_stats["fps"] = fps
                 monitor_stats["alerts"] = alert_count
                 monitor_stats["label"] = current_label
 
-                # Terminal output
+                # Terminal output — show smoothed score with raw in parens for
+                # quick sanity-check on how noisy the underlying signal is.
                 if frame_count % 10 == 0:
-                    bar = "█" * int(score / 5) + "░" * (20 - int(score / 5))
-                    print(f"  [{bar}] {score:5.1f}/100 | {status:30s} | FPS:{fps:.1f}", end="\r")
+                    bar_len = max(0, min(20, int(smoothed_score / 5)))
+                    bar = "█" * bar_len + "░" * (20 - bar_len)
+                    print(f"  [{bar}] {smoothed_score:5.1f} (raw {raw_score:5.1f}) | "
+                          f"{status:30s} | FPS:{fps:.1f}", end="\r")
 
             else:
                 if buzzer_active:
@@ -753,6 +797,10 @@ def monitor_loop(video_path=None, mode="calibrate"):
                     buzzer_active = False
                 bad_start = None
                 good_start = None
+                # Reset EMA + hysteresis so the next appearance starts fresh
+                # instead of inheriting stale state from the previous sit.
+                smoothed_score = None
+                is_bad_state = False
 
                 # Still update frame even without detection
                 cv2.putText(frame_bgr, "No person detected", (150, 250),
@@ -1008,6 +1056,17 @@ if __name__ == "__main__":
             video_path = args[idx + 1]
             if not os.path.exists(video_path):
                 print(f"[ERROR] Not found: {video_path}")
+                sys.exit(1)
+
+    # Optional --port override (useful on macOS where port 5000 is held by
+    # the AirPlay Receiver). Defaults to WEB_PORT defined at the top of the file.
+    if "--port" in args:
+        idx = args.index("--port")
+        if idx + 1 < len(args):
+            try:
+                WEB_PORT = int(args[idx + 1])
+            except ValueError:
+                print(f"[ERROR] Invalid --port value: {args[idx + 1]}")
                 sys.exit(1)
 
     print()
