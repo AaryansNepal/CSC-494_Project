@@ -1251,8 +1251,14 @@ HTML_PAGE = r"""
 <script>
   // ─── state ───
   let lastAlerts = 0;
+  let lastCalibrating = false;
   let selectedSession = null;
   let selectedSessionScores = null;
+
+  function reloadStream() {
+    const img = document.querySelector('.video-card img');
+    if (img) img.src = '/video_feed?t=' + Date.now();
+  }
 
   function fmtClock(seconds) {
     if (!seconds || seconds < 0) return "00:00";
@@ -1424,6 +1430,11 @@ HTML_PAGE = r"""
         overlay.classList.remove('show');
       }
 
+      // Flask's dev server sometimes drops the MJPEG socket across the
+      // calibration→monitoring handoff. Kick the <img> to reopen it.
+      if (lastCalibrating && !s.calibrating) { reloadStream(); }
+      lastCalibrating = !!s.calibrating;
+
       // state badge
       setState(s);
 
@@ -1530,14 +1541,23 @@ def video_feed():
 def generate_stream():
     """Yield MJPEG frames for the browser."""
     while True:
-        with frame_lock:
-            if current_frame is None:
+        try:
+            # Copy the frame inside the lock and release it before encoding
+            # so the monitor thread isn't blocked by cv2.imencode.
+            with frame_lock:
+                frame_copy = current_frame.copy() if current_frame is not None else None
+            if frame_copy is None:
                 time.sleep(0.05)
                 continue
-            _, jpeg = cv2.imencode('.jpg', current_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
-        time.sleep(0.05)
+            _, jpeg = cv2.imencode('.jpg', frame_copy, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
+            time.sleep(0.05)
+        except (GeneratorExit, BrokenPipeError, ConnectionResetError):
+            return            # client disconnected; exit cleanly
+        except Exception as e:
+            print(f"[STREAM] encode error: {e}")
+            time.sleep(0.1)
 
 
 @app.route("/stats")
